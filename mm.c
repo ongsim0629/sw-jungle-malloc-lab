@@ -1,6 +1,6 @@
 /*
-first fit을 이용해서 구현한 implicit 가용 리스트
- */
+first fit을 이용해서 구현한 explicit 가용 리스트
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,14 +38,13 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 // 기존 매크로들
 
-
 // implicit 할당기 제작을 위한 교재 수록 매크로들
 #define WSIZE 4
 #define DSIZE 8
 // 2^12 -> 할당기가 시스템으로부터 요청하는 메모리의 최소 단위
 // 부족하면 이제 추가 메모리 요청할 거임 (최대 MAX_HEAP (20*(1<<20)) 까지 늘리기 가능)
 // 메모리 늘릴 때도 이 chunksize를 단위로 늘어남
-#define CHUNKSIZE (1<<8)
+#define CHUNKSIZE (1<<10)
 
 #define MAX(x, y) ((x) > (y)? (x):(y))
 
@@ -61,42 +60,55 @@ team_t team = {
 #define GET_SIZE(p) (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
 
-// bp는 일반적으로 페이로드의 시작 위치를 가리킴
+// bp는 일반적으로 페이로드의 시작 위치를 가리킴    
 // 포인터가 char* 형이면 그 만큼의 바이트 연산한다고 생각하기
 #define HDRP(bp) ((char *)(bp) - WSIZE)
 // GET_SIZE로 받아온 크기에는 헤더+ 페이로드 + 푸터의 크기임 따라서 헤더 + 푸터인 8을 빼주어야지 푸터의 시작 위치임
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE) 
 
-// 다음 블록 혹은 이전 블록의 포인트 얻기!
+// 다음 블록 혹은 이전 블록의 포인터 얻기!
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
 // implicit 할당기 제작을 위한 교재 수록 매크로들
+
+// 이전 가용 블록의 포인터를 얻는 매크로
+#define PREV_FREEP(bp) (*(void **)(bp))
+
+// 다음 가용 블록의 포인터를 얻는 매크로
+#define NEXT_FREEP(bp) (*(void **)((char *)(bp) + WSIZE))
+
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void place(void *bp, size_t asize);
 static void *find_fit(size_t asize);
 
-//항상 프롤로그 가운데를 가리키는 변수!
-static char *heap_listp;
-// next fit 하려면 마지막 검색 위치 저장하는 애 필요하다
-static char *last_bp; 
+//연결 리스트의 시작을 가리키는 포인터
+static char *root;
 
 // 할당기 초기화 하기 -> 초기 가용 리스트 ㄱㄱ
 int mm_init(void)
 {
-    // 4바이트 4개 -> 프롤로그 2개, 에필로그 1개, 패딩 1개
-    if((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) 
+    // 4바이트 6개 -> 프롤로그 2개, 에필로그 1개, 패딩 1개 + 포인터 2개
+    // heap_list가 뭔가 많이 관여하지 않는 것 같아서 그냥 그걸 root로 써보면 어떤지 -> 일단 함 해봄
+    if((root = mem_sbrk(6*WSIZE)) == (void *)-1) 
         return -1;
 
     // 패딩을 써야지 실제 블록들을 8의 배수로 할 수 있다                
-    PUT(heap_listp, 0);                         
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE,1)); 
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE,1)); 
-    PUT(heap_listp + (3*WSIZE), PACK(0,1)); 
+    PUT(root, 0);
+    // 프롤 헤더                         
+    PUT(root + (1*WSIZE), PACK(2*DSIZE,1)); 
+    // prev 포인터
+    PUT(root + (2*WSIZE), NULL); 
+    // next 포인터
+    PUT(root + (3*WSIZE), NULL);
+    // 프롤 푸터
+    PUT(root + (4*WSIZE), PACK(2*DSIZE,1));
+    // 에필 헤더
+    PUT(root + (5*WSIZE), PACK(0,1));
 
-    // init되고 처음에는 프롤로그 헤더와 푸터 사이를 가리키게 된다
-    heap_listp += (2*WSIZE);
+    // root의 prev 가리킬 수 있도록 함
+    root += (2*WSIZE);
 
     // 지금은 진심 초기화니까 -> malloc으로 동적 할당할 공간이 없응게 만들어줘야지
     // 얼만큼 추가 공간 만들어주냐면 1024 워드 만큼의 추가 공간 확보
@@ -134,19 +146,91 @@ static void *extend_heap(size_t words){
     return coalesce(bp);
 }
 
-void mm_free(void *bp) {
-    // 일단 지금 bp의 헤더에서 현재 블록의 사이즈 받아옴
-    size_t size = GET_SIZE(HDRP(bp));
-
-    // 현재 블록의 헤더와 푸터 할당 -> 할당 x로 바꾸어줌
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
-
-    // 앞 뒤 블록 가용 상태였을수도 있으니까 확인해주기
-    coalesce(bp);
+// 해제된 블록의 prev와 next는 더 이상 연결 리스트에 필요하지 않기 때문에 그 값을 수정할 필요가 없고,
+// 해제할 블록의 앞과 뒤만 신경쓰면 된다.
+static void *disconnect_linked_list(void *bp){
+    // 내가 스택 맨 위였으면
+    if (bp == root) {
+      PREV_FREEP(NEXT_FREEP(bp)) = NULL;
+      root = NEXT_FREEP(bp);
+    }
+    // 내가 스택 중간이었다면
+    else {
+        NEXT_FREEP(PREV_FREEP(bp)) = NEXT_FREEP(bp);
+        PREV_FREEP(NEXT_FREEP(bp)) = PREV_FREEP(bp);
+    }
 }
 
-// 앞 뒤 블록 확인하고 가용 상태면 통합 해준 다음에 통합된 블록의 주소 리턴
+// 무조건 bp1이 메모리상 앞에 있는 애임 -> 그렇게 전해주니까
+static void *disconnect_two_block(void *bp1, void *bp2) {
+    // 첫 번째 블록 bp1이 root이고, 두 블록이 연결된 경우
+    if (bp1 == root && NEXT_FREEP(bp1) == bp2) {
+        if (NEXT_FREEP(bp2) != NULL) {
+            // bp2가 다음 블록을 가리키고 있을 때, 그 다음 블록의 PREV 포인터를 NULL로 설정
+            PREV_FREEP(NEXT_FREEP(bp2)) = NULL;
+        }
+        // root를 bp2의 다음 블록으로 갱신
+        root = NEXT_FREEP(bp2);
+    }
+    // 첫 번째 블록 bp1이 root이고, 두 블록이 직접 연결되어 있지 않은 경우
+    else if (bp1 == root && NEXT_FREEP(bp1) != bp2) {
+        if (NEXT_FREEP(bp1) != NULL) {
+            // bp1의 다음 블록의 PREV 포인터를 NULL로 설정
+            PREV_FREEP(NEXT_FREEP(bp1)) = NULL;
+        }
+        // root를 bp1의 다음 블록으로 갱신
+        root = NEXT_FREEP(bp1);
+        // bp2와 그 다음 블록 사이의 연결을 해제
+        if (NEXT_FREEP(bp2) != NULL) {
+            PREV_FREEP(NEXT_FREEP(bp2)) = PREV_FREEP(bp2);
+        }
+        if (PREV_FREEP(bp2) != NULL) {
+            NEXT_FREEP(PREV_FREEP(bp2)) = NEXT_FREEP(bp2);
+        }
+    }
+    // bp1이 root가 아니고 두 블록이 연결된 경우
+    else if (bp1 != root && NEXT_FREEP(bp1) == bp2) {
+        if (NEXT_FREEP(bp2) != NULL) {
+            PREV_FREEP(NEXT_FREEP(bp2)) = PREV_FREEP(bp1);
+        }
+        if (PREV_FREEP(bp1) != NULL) {
+            NEXT_FREEP(PREV_FREEP(bp1)) = NEXT_FREEP(bp2);
+        }
+    }
+    // bp1이 root가 아니고 두 블록이 직접 연결되어 있지 않은 경우
+    else {
+        if (NEXT_FREEP(bp1) != NULL) {
+            PREV_FREEP(NEXT_FREEP(bp1)) = PREV_FREEP(bp1);
+        }
+        if (PREV_FREEP(bp1) != NULL) {
+            NEXT_FREEP(PREV_FREEP(bp1)) = NEXT_FREEP(bp1);
+        }
+        if (NEXT_FREEP(bp2) != NULL) {
+            PREV_FREEP(NEXT_FREEP(bp2)) = PREV_FREEP(bp2);
+        }
+        if (PREV_FREEP(bp2) != NULL) {
+            NEXT_FREEP(PREV_FREEP(bp2)) = NEXT_FREEP(bp2);
+        }
+    }
+    return NULL;
+}
+
+// bp를 링크드 리스트에 넣어주고 root로 바꾸는 함수!
+static void extend_linked_list(void *bp){
+    // 얘가 스택 제일 위의 값이므로
+    PREV_FREEP(bp) = NULL;
+    // root => 원래 스택 제일 위 값
+    NEXT_FREEP(bp) = root;
+    // 원래 스택 제일 위의 값의 prev도 없데이트 해주고
+    if (root != NULL) {
+        PREV_FREEP(root) = bp;
+    }
+    // 이제 root는 마지막으로 가용처리된 bp인거임~~~
+    root = bp;
+}
+
+// 앞 뒤 블록 확인하고 가용 상태면 통합 해준 다음에
+// 통합된 블록을!!! 연결 리스트에 추가할 수 있게 그 블록을 연결 리스트 추가 함수에 넘겨주는 역할
 static void *coalesce(void *bp){
     // 현재 블록의 이전 블록의 푸터로부터 가용, 할당 정보 꿍쳐오기
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
@@ -156,12 +240,17 @@ static void *coalesce(void *bp){
     size_t size = GET_SIZE(HDRP(bp));
 
     // 첫 번째 경우: 앞 뒤 둘 다 할당된 상태
-    // 그럼 그냥 지금 블록만 가즈가십쇼
+    // 그럼 그냥 지금 블록만 연결 리스트의 맨 앞에 추가
+    // 그냥 지금 bp에서 뭐 수정할거 없다!
     if (prev_alloc == 1 && next_alloc == 1){
     }
 
     // 두 번째 경우 : 뒤 블록만 가용 상태
+    // 지금 블럭에 뒤 블록까지 연장한 블록을 연결 리스트에 맨 앞에 추가해준다
+    // 뒤 블록은 그럼 연결리스트 어딘가에 저장되어있었을테니까 그 연결 끊어주는 과정도 필요하다 -> disconnect_linked_list에서 분담하기
+    // 현재 bp에 대한 수정은 필요없음!
     else if (prev_alloc == 1 && next_alloc == 0){
+        disconnect_linked_list(NEXT_BLKP(bp));
         // 지금 사이즈에 다음 블록의 사이즈 더해서 사이즈 업데이트
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         // 현재 블록의 헤더에 업데이트된 사이즈와 가용 표시
@@ -172,25 +261,47 @@ static void *coalesce(void *bp){
     }
 
     // 세 번째 경우 : 앞 블록만 가용 상태
+    // 지금 블럭에 앞 블록까지 연장한 블록을 연결 리스트 맨 앞에 추가해준다.
+    // 앞 블록은 그럼 연결리스트 어딘가에 저장되어있었을테니까 그 연결 끊어주는 과정도 필요하다 -> disconnect_linked_list에서 분담하기
+    // bp의 위치를 앞 블록의 bp로 이동시켜주기!
     else if (prev_alloc == 0 && next_alloc == 1){
+        disconnect_linked_list(PREV_BLKP(bp));
         size += GET_SIZE(FTRP(PREV_BLKP(bp)));
-        // 끝나는 위치는 일단 현재 블록이랑 똑같음 (앞 블록만 가용이니까)
-        PUT(FTRP(bp), PACK(size, 0));
-        // 시작하는 위치는 PREV_BLKP로 접근해줘야함 아니면 방법 X
-        // 원래 앞 블록의 헤더 위치에 업데이트된 사이즈와 가용 표시해주기
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         // bp 업데이트
         bp = (PREV_BLKP(bp));
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0));
     }
 
     // 네 번째 경우 : 앞, 뒤 둘 다 가용
+    // 지금 블럭에 앞 블록 + 뒷 블록 연장한 블록을 연결 리스트 맨 앞에 추가해준다.
+    // 앞 뒤 블록이 연결리스트에 저장되어 있을 테니까 그거 끊어주기 -> 두 블록이 연결되어 있을 가능성 있음!!!!!! -> 이거 disconnect_linked_list 구현할때 꼭꼮꼭 신경쓰렴 수빈아
+    // 아니면 두 블록을 끊는 disconnetc_two_blocks를 새로 만들자!
+    // bp위치 앞 블록의 bp로 이동해야함!!
     else {
+        // disconnect_two_block(PREV_BLKP(bp), NEXT_BLKP(bp));
+        disconnect_linked_list(PREV_BLKP(bp));
+        disconnect_linked_list(NEXT_BLKP(bp));
         size += GET_SIZE(FTRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = (PREV_BLKP(bp));
     }
+
+    extend_linked_list(bp);
     return bp;
+}
+
+void mm_free(void *bp) {
+    // 일단 지금 bp의 헤더에서 현재 블록의 사이즈 받아옴
+    size_t size = GET_SIZE(HDRP(bp));
+
+    // 현재 블록의 헤더와 푸터 할당 -> 할당 x로 바꾸어줌
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+
+    // 앞 뒤 블록 가용 상태였을수도 있으니까 확인해주기
+    coalesce(bp);
 }
 
 // 인자로 주어진 size 만큼의 메모리를 할당해준다.
@@ -270,18 +381,15 @@ void *mm_realloc(void *ptr, size_t size)
 
 // first fit으로 뒤지기
 // 찾으면 그 블록의 포인터 리턴해줘야함
-static void *find_fit(size_t asize)
-{
-    // 일단 포인터 초기화
-    char *bp = NULL;
-    // heap_listp -> 프롤로그 헤더랑 푸터 사이 가리키는 중
-    // 헤더의 사이즈 0 => 에필로그 헤더란 말
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-        if (GET_ALLOC(HDRP(bp)) == 0 && (asize <= GET_SIZE(HDRP(bp)))) {
+static void *find_fit(size_t asize){
+    void *bp = root;
+    // 가용 블록 리스트 처음부터 끝까지 뒤지기 -> first fit
+    while (bp != NULL) {
+        if (GET_SIZE(HDRP(bp)) >= asize) {
             return bp;
         }
+        bp = NEXT_FREEP(bp);
     }
-    // 못 찾으면 NULL 리턴해줘야함 -> 그래야 malloc에서 못 찾은 경우 연산 가능해짐
     return NULL;
 }
 
@@ -289,6 +397,7 @@ static void *find_fit(size_t asize)
 static void place(void *bp, size_t asize) {
     // 현재 가용 블록의 전체 크기
     size_t csize = GET_SIZE(HDRP(bp));
+    disconnect_linked_list(bp);
     // csize랑 asize 차이가 16바이트 (4워드) 보다 작으면 사용 가능!
     // 왜냐면 할당해주고 남은 애들 다시
     // 패딩 
@@ -300,6 +409,7 @@ static void place(void *bp, size_t asize) {
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(csize - asize, 0));
         PUT(FTRP(bp), PACK(csize - asize, 0));
+        extend_linked_list(bp);
     }
     // 분할 안 하고 그냥 다 쓰겠다
     else {
@@ -307,13 +417,3 @@ static void place(void *bp, size_t asize) {
         PUT(FTRP(bp), PACK(csize, 1));
     }
 }
-
-
-
-
-
-
-
-
-
-
